@@ -17,12 +17,29 @@ batch_size = int(os.environ["BS"])
 input_len = int(os.environ["ILEN"])
 output_len = int(os.environ["OLEN"])
 warmup_output_len = int(os.environ["WARMUP_OLEN"])
+decode_profile_steps = int(os.environ.get("DECODE_PROFILE_STEPS", "100"))
 tp = int(os.environ["TP"])
 bench_mode = os.environ["BENCH_MODE"]
 cache_hit_len = int(os.environ["CACHE_HIT_LEN"])
 model_dir = os.environ["MODEL_DIR"]
 profile_dir = os.environ["PROFILE_DIR"]
 profile_stage = os.environ.get("PROFILE_STAGE", "full")
+max_model_len = int(os.environ.get("MAX_MODEL_LEN", str(input_len + output_len)))
+gpu_memory_utilization = float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.9"))
+reasoning_parser = os.environ.get("REASONING_PARSER", "qwen3").strip()
+performance_mode = os.environ.get("PERFORMANCE_MODE", "throughput")
+max_num_batched_tokens = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", str(max(max_model_len, batch_size * input_len))))
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
+language_model_only = parse_bool_env("LANGUAGE_MODEL_ONLY", True)
+enable_prefix_caching = parse_bool_env("ENABLE_PREFIX_CACHING", True)
 
 assert bench_mode in {"static_forward", "cache_hit", "both"}, bench_mode
 assert 0 <= cache_hit_len <= input_len, f"CACHE_HIT_LEN must be in [0, {input_len}], got {cache_hit_len}"
@@ -53,30 +70,22 @@ def build_llm() -> LLM:
     # aligns the decode test cadence with lightllm, which profiles exactly one
     # isolated decode forward.
     #
-    # enable_chunked_prefill=False is equally critical for prefill alignment:
-    # with chunked prefill enabled, V1 can split a cold batch of
-    # batch_size * input_len tokens across multiple scheduler steps (and often
-    # only admits a single waiting request per step). Our profile window only
-    # covers step_index == 0, so a chunked prefill would measure a tiny slice
-    # of the true cold-prefill work — making static_forward prefill look as
-    # cheap as cache_hit prefill. Disabling chunked prefill forces V1 to run
-    # the entire `batch_size * input_len` token batch in one engine.step(),
-    # which is the whole prefill (matches lightllm's single-shot prefill).
-    # Safe because max_num_batched_tokens is sized to exactly fit the batch.
     return LLM(
         model=model_dir,
-        skip_tokenizer_init=True,
         tensor_parallel_size=tp,
         dtype="bfloat16",
-        max_model_len=32768,
+        max_model_len=max_model_len,
         max_num_seqs=batch_size,
-        max_num_batched_tokens=batch_size * input_len,
-        enable_prefix_caching=True,
-        enable_chunked_prefill=False,
+        max_num_batched_tokens=max_num_batched_tokens,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=enable_prefix_caching,
         enforce_eager=False,
         disable_log_stats=False,
-        async_scheduling=False,
+        async_scheduling=True,
+        language_model_only=language_model_only,
+        performance_mode=performance_mode,
         profiler_config=build_profiler_config(),
+        **({"reasoning_parser": reasoning_parser} if reasoning_parser else {}),
     )
 
 
@@ -317,7 +326,10 @@ def generate_with_split_profile(
 
     profiled_stage: str | None = None
     profile_snapshot: dict[str, tuple[int, int]] | None = None
-    decode_profile_step = output_len - 1 if output_len > 1 else None
+    decode_profile_end_step = output_len - 1 if output_len > 1 else None
+    decode_profile_start_step = None
+    if decode_profile_end_step is not None and decode_profile_steps > 0:
+        decode_profile_start_step = max(1, decode_profile_end_step - decode_profile_steps + 1)
     step_index = 0
 
     while llm.llm_engine.has_unfinished_requests():
@@ -330,16 +342,23 @@ def generate_with_split_profile(
             # torch.cuda.synchronize() before `with profile(...)`).
             torch.cuda.synchronize()
             llm.start_profile(profile_prefix=prefill_profile_prefix)
-        elif decode_profile_step is not None and step_index == decode_profile_step:
+        elif decode_profile_start_step is not None and step_index == decode_profile_start_step:
             profiled_stage = "decode"
             profile_snapshot = snapshot_profile_files()
-            print(f"Profile Decode -> {os.path.join(profile_dir, 'forward_decode_*')}")
+            print(
+                f"Profile Decode last {decode_profile_steps} steps "
+                f"({decode_profile_start_step}..{decode_profile_end_step}) -> "
+                f"{os.path.join(profile_dir, 'forward_decode_*')}"
+            )
             torch.cuda.synchronize()
             llm.start_profile(profile_prefix=decode_profile_prefix)
 
         step_outputs = llm.llm_engine.step()
 
-        if profiled_stage is not None:
+        should_stop_profile = profiled_stage == "prefill" or (
+            profiled_stage == "decode" and decode_profile_end_step is not None and step_index >= decode_profile_end_step
+        )
+        if should_stop_profile:
             # Ensure the profile window contains exactly this step's GPU
             # kernels before stopping, mirroring lightllm's
             # torch.cuda.synchronize(); prof.step() inside the context.

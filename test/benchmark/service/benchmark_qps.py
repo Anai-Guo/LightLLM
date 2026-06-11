@@ -109,8 +109,8 @@ def get_custom_input_data(data_path, output_len, tokenizer, range_ratio):
 
 model_name = []
 sampling_config = {
-    "temperature": 1.0,
-    "top_p": 0.9,
+    "temperature": 0.0,
+    "top_p": 1.0,
     "top_k": -1,
 }
 

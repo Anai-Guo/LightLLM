@@ -2,17 +2,27 @@
 set -eu
 
 # Keep knobs in lock-step with lightllm.sh so profile results line up 1:1.
-export BS=${BS:-8}
-export ILEN=${ILEN:-10000}
-export OLEN=${OLEN:-500}
+export BS=${BS:-4}
+export ILEN=${ILEN:-1000}
+export OLEN=${OLEN:-10000}
 export WARMUP_OLEN=${WARMUP_OLEN:-10}
+export DECODE_PROFILE_STEPS=${DECODE_PROFILE_STEPS:-100}
 export TP=${TP:-8}
 export BENCH_MODE=${1:-${BENCH_MODE:-both}}
 export CACHE_HIT_LEN=${CACHE_HIT_LEN:-$((ILEN - 1))}
+# For static profiling, use the actual request total length by default rather
+# than the online service ceiling; otherwise vLLM's throughput warmup compiles
+# and profiles an unnecessarily huge sequence length and can OOM.
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((ILEN + OLEN))}
+export GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.9}
+export REASONING_PARSER=${REASONING_PARSER:-qwen3}
+export LANGUAGE_MODEL_ONLY=${LANGUAGE_MODEL_ONLY:-1}
+export PERFORMANCE_MODE=${PERFORMANCE_MODE:-throughput}
+export ENABLE_PREFIX_CACHING=${ENABLE_PREFIX_CACHING:-1}
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export ROOT_DIR
-export MODEL_DIR=${MODEL_DIR:-../Qwen3-235B-A22B}
+export MODEL_DIR=${MODEL_DIR:-../Qwen3.5-122B-A10B}
 # Mirror lightllm's `./logs/forward_{prefill|decode}_<rank>/` layout. Only the
 # top-level directory name differs (profiles/ vs logs/) so vLLM and lightllm
 # artefacts don't clash when both are inspected side-by-side. Running
@@ -21,8 +31,6 @@ export MODEL_DIR=${MODEL_DIR:-../Qwen3-235B-A22B}
 export PROFILE_ROOT=${PROFILE_ROOT:-$ROOT_DIR/profiles}
 
 # --- vLLM engine knobs ------------------------------------------------------
-# Force V1 engine (matches what LightLLM is effectively being compared to).
-export VLLM_USE_V1=${VLLM_USE_V1:-1}
 # Align attention backend with lightllm (flashinfer on both prefill & decode).
 # export VLLM_ATTENTION_BACKEND=${VLLM_ATTENTION_BACKEND:-FLASHINFER}
 # Spawn start method for multiprocessing workers (see repo memory notes on

@@ -355,9 +355,7 @@ def run_forward_once(
         prefix_total_token_num=prefix_total_token_num,
     )
 
-    prob_out = torch.softmax(logits, dim=-1)
-    predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
-    _ = predict_ids.detach().cpu().numpy()
+    predict_ids = torch.argmax(logits, dim=1, keepdim=True)
 
     torch.cuda.synchronize()
 
@@ -393,9 +391,11 @@ def run_forward_once(
             print(str(e))
             raise
 
-    for i in range(output_len):
-        torch.cuda.synchronize()
-        step_start = time.time()
+    def run_decode_step(i, measure_step: bool = True):
+        nonlocal total_token_num, b_seq_len, predict_ids
+        if measure_step:
+            torch.cuda.synchronize()
+            step_start = time.time()
         total_token_num += batch_size
         b_seq_len += 1
         mem_indexes = model_part.req_manager.mem_manager.alloc(predict_ids.shape[0])
@@ -412,40 +412,44 @@ def run_forward_once(
             total_token_num,
         )
 
-        prob_out = torch.softmax(logits, dim=-1)
-        predict_ids = torch.argmax(prob_out, dim=1, keepdim=True)
-        _ = predict_ids.detach().cpu().numpy()
-        torch.cuda.synchronize()
-        if i % 100 == 0 or i == output_len - 1:
-            if rank_id == 0:
-                print(
-                    f"i: {i}, step cost time: {(time.time() - step_start) * 1000} ms, "
-                    f"throughput: {dp_size * batch_size / (time.time() - step_start)} tokens/s"
-                )
+        predict_ids = torch.argmax(logits, dim=1, keepdim=True)
+        if measure_step:
+            torch.cuda.synchronize()
+            if i % 100 == 0 or i == output_len - 1:
+                if rank_id == 0:
+                    print(
+                        f"i: {i}, step cost time: {(time.time() - step_start) * 1000} ms, "
+                        f"throughput: {dp_size * batch_size / (time.time() - step_start)} tokens/s"
+                    )
+
+    decode_profile_steps = min(int(os.environ.get("DECODE_PROFILE_STEPS", "100")), output_len)
+    decode_profile_start = (
+        output_len - decode_profile_steps if enable_torch_profile and decode_profile_steps > 0 else output_len
+    )
+
+    for i in range(decode_profile_start):
+        run_decode_step(i)
 
     if enable_torch_profile:
-        profile_mem_indexes = model_part.req_manager.mem_manager.alloc(predict_ids.shape[0])
-        profile_b_seq_len = b_seq_len + 1
-        profile_total_token_num = total_token_num + batch_size
-        profile_max_len_in_batch = input_len + output_len + 1
+        if rank_id == 0:
+            print(f"Profile Decode last {decode_profile_steps} steps " f"({decode_profile_start}..{output_len - 1})")
+
+        def run_decode_profile_window():
+            for step_i in range(decode_profile_start, output_len):
+                with record_function(f"DecodeStep#{step_i}"):
+                    run_decode_step(step_i, measure_step=False)
+
         try:
             torch_profile(
-                lambda: decode_fn(
-                    model_part,
-                    batch_size,
-                    profile_max_len_in_batch,
-                    predict_ids.view(-1),
-                    profile_mem_indexes,
-                    b_req_idx,
-                    b_mtp_index,
-                    profile_b_seq_len,
-                    profile_total_token_num,
-                ),
+                run_decode_profile_window,
                 log_dir=f"./logs/forward_decode_{model_kvargs['rank_id']}",
             )
         except Exception as e:
             print(str(e))
             raise
+    else:
+        for i in range(decode_profile_start, output_len):
+            run_decode_step(i)
 
     model_part.mem_manager.free_all()
     model_part.req_manager.free_all()
